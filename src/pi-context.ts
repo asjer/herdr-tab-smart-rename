@@ -9,6 +9,11 @@ const SESSION_HEAD_BYTES = 64 * 1024;
 const SESSION_MIDDLE_BYTES = 256 * 1024;
 const SESSION_TAIL_BYTES = 512 * 1024;
 
+const SessionInfoSchema = z.object({
+  type: z.literal("session_info"),
+  name: z.string().optional(),
+});
+
 const UserMessageSchema = z.object({
   type: z.literal("message"),
   message: z.object({
@@ -91,6 +96,22 @@ async function readSessionWindow(
   return text;
 }
 
+function sessionNameFrom(text: string): string | undefined {
+  let name: string | undefined;
+  for (const rawLine of text.split("\n")) {
+    const line = rawLine.endsWith("\r") ? rawLine.slice(0, -1) : rawLine;
+    if (!line) continue;
+    try {
+      const entry = SessionInfoSchema.safeParse(JSON.parse(line));
+      const value = entry.success ? boundedText(entry.data.name, 200) : "";
+      if (value) name = value;
+    } catch {
+      // Ignore partial and non-JSON records.
+    }
+  }
+  return name;
+}
+
 function userMessagesFrom(text: string): string[] {
   const messages: string[] = [];
   for (const rawLine of text.split("\n")) {
@@ -159,10 +180,15 @@ export async function sampledUserMessages(
     const head = userMessagesFrom(headText);
     const middle = userMessagesFrom(middleText);
     const recent = userMessagesFrom(tailText);
+    const name =
+      sessionNameFrom(tailText) ??
+      sessionNameFrom(middleText) ??
+      sessionNameFrom(headText);
     const originMessage = head[0];
     const middleMessage = middle[Math.floor(middle.length / 2)];
     const seen = new Set([originMessage, middleMessage].filter(Boolean));
     return {
+      ...(name ? { name } : {}),
       origin: originMessage ? [originMessage] : [],
       middle:
         middleMessage && middleMessage !== originMessage ? [middleMessage] : [],

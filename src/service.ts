@@ -9,6 +9,7 @@ import {
   prepareRename,
   reconcileItem,
   resetOwnership,
+  sessionTabLabel,
   shouldCallModel,
   workspaceCandidate,
   type PaneContext,
@@ -224,8 +225,16 @@ export class AutoNameService {
     const snap = initial ?? (await this.#dependencies.snapshot(this.#env));
     const results: RenameResult[] = [];
     for (const tab of snap.tabs) {
-      const result = await this.evaluate(tab.tab_id, options);
-      if (result) results.push(result);
+      try {
+        const result = await this.evaluate(tab.tab_id, options);
+        if (result) results.push(result);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        // A single malformed model suggestion must not prevent the remaining
+        // tabs from being evaluated by the explicit "all tabs" action.
+        if (message.includes("invalid model tab label")) continue;
+        throw error;
+      }
     }
     return results;
   }
@@ -308,10 +317,24 @@ export class AutoNameService {
       const details = await this.contextFor(tab, snap, workspaceName);
       const focusedContext = details.paneContexts.find((pane) => pane.focused);
       const hasUserTask = Boolean(focusedContext?.userMessages.length);
-      const heuristic = hasUserTask
+      const piSessionName =
+        details.focusedPane?.agent === "pi"
+          ? sessionTabLabel(focusedContext?.sessionMessages?.name)
+          : null;
+      const waitingForPiPrompt =
+        details.focusedPane?.agent === "pi" &&
+        !hasUserTask &&
+        !options.forceModel &&
+        !options.forceRefresh;
+      const heuristic = hasUserTask || waitingForPiPrompt
         ? null
         : heuristicTitle(focusedContext ? { focusedPane: focusedContext } : {});
-      if (heuristic && !options.forceModel) {
+      if (piSessionName) {
+        tabName = piSessionName;
+        reason = "Pi session name";
+      } else if (waitingForPiPrompt) {
+        reason = "waiting for first Pi user prompt";
+      } else if (heuristic && !options.forceModel) {
         tabName = heuristic;
         reason = "process heuristic";
       } else {

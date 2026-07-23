@@ -24,6 +24,14 @@ import { sanitizeText } from "../src/text.ts";
 test("ownership transitions preserve manual names and expected writes", () => {
   assert.equal(isDefaultLabel("12", 12), true);
   assert.equal(reconcileItem(undefined, "3", true).manual, false);
+  assert.deepEqual(
+    reconcileItem(
+      { manual: true, autoLabel: "Old Automatic Name", observedLabel: "Old Automatic Name" },
+      "1",
+      true,
+    ),
+    { manual: false, observedLabel: "1" },
+  );
   assert.equal(reconcileItem(undefined, "Manual Task", false).manual, true);
   assert.equal(
     reconcileItem({ autoLabel: "Build API" }, "Manual Name").manual,

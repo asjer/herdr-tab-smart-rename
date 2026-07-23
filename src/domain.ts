@@ -26,6 +26,7 @@ export interface ProcessInfo {
 }
 
 export interface SessionTimeline {
+  name?: string;
   origin: string[];
   middle: string[];
   recent: string[];
@@ -109,6 +110,12 @@ export function reconcileItem(
 ): OwnershipRecord {
   const next = { ...record };
   const previousObserved = next.observedLabel;
+  // Herdr reuses workspace/tab IDs after items are closed. A numeric default
+  // label therefore represents an auto-nameable item even when stale state
+  // for that ID contains an earlier automatic or manual title.
+  if (eligible) {
+    return { manual: false, observedLabel: currentLabel };
+  }
   if (next.expectedLabel) {
     if (currentLabel === next.expectedLabel) {
       next.autoLabel = currentLabel;
@@ -178,6 +185,15 @@ export function titleCase(input: unknown): string {
         : word[0]!.toUpperCase() + word.slice(1).toLowerCase(),
     )
     .join(" ");
+}
+
+export function sessionTabLabel(name: unknown): string | null {
+  const value = sanitizeText(name);
+  if (!value) return null;
+  if (value.length <= MAX_TAB_LENGTH) return value;
+  const shortened = value.slice(0, MAX_TAB_LENGTH + 1);
+  const boundary = shortened.lastIndexOf(" ");
+  return (boundary >= 12 ? shortened.slice(0, boundary) : value.slice(0, MAX_TAB_LENGTH)).trim();
 }
 
 export function validateTabLabel(label: unknown): label is string {
