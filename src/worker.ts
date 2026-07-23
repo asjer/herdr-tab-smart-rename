@@ -12,6 +12,7 @@ import { createService } from "./service.ts";
 import {
   ensurePrivateDir,
   removeOwnedWorkerPid,
+  runtimeStateDir,
   statePaths,
 } from "./storage.ts";
 
@@ -35,8 +36,9 @@ export function shouldIgnoreProgressRename(
 export async function runWorker(
   env: NodeJS.ProcessEnv = process.env,
 ): Promise<void> {
-  const stateDir = env.HERDR_PLUGIN_STATE_DIR;
-  if (!stateDir) throw new Error("HERDR_PLUGIN_STATE_DIR is required");
+  const stateRoot = env.HERDR_PLUGIN_STATE_DIR;
+  if (!stateRoot) throw new Error("HERDR_PLUGIN_STATE_DIR is required");
+  const stateDir = runtimeStateDir(stateRoot, env.HERDR_SOCKET_PATH);
   await ensurePrivateDir(stateDir);
   const paths = statePaths(stateDir);
   const service = createService({ stateDir, env });

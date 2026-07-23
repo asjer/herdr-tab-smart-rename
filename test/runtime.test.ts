@@ -5,7 +5,12 @@ import os from "node:os";
 import path from "node:path";
 import { currentResultNotice, dispatch } from "../src/cli.ts";
 import { type RenameResult } from "../src/domain.ts";
-import { acquireLock, pidAlive, workerInfo } from "../src/storage.ts";
+import {
+  acquireLock,
+  pidAlive,
+  runtimeStateDir,
+  workerInfo,
+} from "../src/storage.ts";
 import { shouldIgnoreProgressRename } from "../src/worker.ts";
 
 test("CLI dispatch routes actions without executing on import", async () => {
@@ -105,6 +110,26 @@ test("Bun launcher survives Herdr's minimal server PATH", async () => {
   } finally {
     await rm(home, { recursive: true, force: true });
   }
+});
+
+test("runtime state is isolated by Herdr socket", () => {
+  const root = "/state/tab-smart-rename";
+  const defaultSocket = "/config/herdr/herdr.sock";
+  const namedSocket = "/config/herdr/sessions/devtools/herdr.sock";
+
+  assert.equal(runtimeStateDir(root, undefined), root);
+  assert.equal(
+    runtimeStateDir(root, defaultSocket),
+    runtimeStateDir(root, defaultSocket),
+  );
+  assert.notEqual(
+    runtimeStateDir(root, defaultSocket),
+    runtimeStateDir(root, namedSocket),
+  );
+  assert.match(
+    runtimeStateDir(root, namedSocket),
+    /^\/state\/tab-smart-rename\/sessions\/[a-f0-9]{16}$/,
+  );
 });
 
 test("locks recover dead owners and workers require exact Bun scripts", async () => {

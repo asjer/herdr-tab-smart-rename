@@ -9,6 +9,7 @@ import {
   stat,
   writeFile,
 } from "node:fs/promises";
+import { createHash } from "node:crypto";
 import path from "node:path";
 import { z } from "zod";
 import {
@@ -54,6 +55,18 @@ export interface StatePaths {
   startLock: string;
   stateLock: string;
   log: string;
+}
+
+export function runtimeStateDir(
+  stateRoot: string,
+  socketPath: string | undefined,
+): string {
+  if (!socketPath) return stateRoot;
+  const socketId = createHash("sha256")
+    .update(socketPath)
+    .digest("hex")
+    .slice(0, 16);
+  return path.join(stateRoot, "sessions", socketId);
 }
 
 export function statePaths(stateDir: string): StatePaths {

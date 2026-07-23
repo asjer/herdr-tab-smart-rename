@@ -9,6 +9,7 @@ import { createService } from "./service.ts";
 import {
   acquireLock,
   ensurePrivateDir,
+  runtimeStateDir,
   statePaths,
   workerInfo,
 } from "./storage.ts";
@@ -24,7 +25,7 @@ function requireStateDir(): string {
       "HERDR_PLUGIN_STATE_DIR is required (Herdr sets it for plugin actions)",
     );
   }
-  return stateDir;
+  return runtimeStateDir(stateDir, process.env.HERDR_SOCKET_PATH);
 }
 
 async function notify(
