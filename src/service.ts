@@ -1,8 +1,10 @@
 import {
   acknowledgeRename,
+  aiCircuitAllows,
   buildModelContext,
   heuristicTitle,
   isDefaultLabel,
+  markAiFailure,
   markModelAttempt,
   markModelSuccess,
   observeStableContext,
@@ -28,7 +30,12 @@ import {
   type HerdrTab,
   type HerdrWorkspace,
 } from "./herdr.ts";
-import { AiSdkNamer, type Namer } from "./provider.ts";
+import {
+  AiSdkNamer,
+  aiEnabled as explicitAiEnabled,
+  classifyAiFailure,
+  type Namer,
+} from "./provider.ts";
 import {
   loadState,
   statePaths,
@@ -71,6 +78,8 @@ interface ServiceOptions {
   namer: Namer;
   env?: NodeJS.ProcessEnv;
   dryRun?: boolean;
+  aiEnabled?: boolean;
+  now?: () => number;
   modelActivity?: ModelActivity;
   dependencies?: Partial<ServiceDependencies>;
 }
@@ -129,6 +138,8 @@ export class AutoNameService {
   readonly #namer: Namer;
   readonly #env: NodeJS.ProcessEnv;
   readonly #dryRun: boolean;
+  readonly #aiEnabled: boolean;
+  readonly #now: () => number;
   readonly #modelActivity: ModelActivity | undefined;
   readonly #dependencies: ServiceDependencies;
 
@@ -138,6 +149,8 @@ export class AutoNameService {
     namer,
     env = process.env,
     dryRun = false,
+    aiEnabled = false,
+    now = Date.now,
     modelActivity,
     dependencies = {},
   }: ServiceOptions) {
@@ -146,6 +159,8 @@ export class AutoNameService {
     this.#namer = namer;
     this.#env = env;
     this.#dryRun = dryRun;
+    this.#aiEnabled = aiEnabled;
+    this.#now = now;
     this.#modelActivity = modelActivity;
     this.#dependencies = { ...defaultDependencies, ...dependencies };
   }
@@ -334,7 +349,7 @@ export class AutoNameService {
         reason = "Pi session name";
       } else if (waitingForPiPrompt) {
         reason = "waiting for first Pi user prompt";
-      } else if (heuristic && !options.forceModel) {
+      } else if (heuristic && (!options.forceModel || !this.#aiEnabled)) {
         tabName = heuristic;
         reason = "process heuristic";
       } else {
@@ -346,10 +361,14 @@ export class AutoNameService {
           observeStableContext(state, tab.tab_id, details.context);
         if (!contextReady) {
           reason = "waiting for stable command context";
+        } else if (!this.#aiEnabled) {
+          reason = "AI disabled";
+        } else if (!aiCircuitAllows(state, this.#now())) {
+          reason = `AI cooling down (${state.aiCircuit?.category ?? "unknown"})`;
         } else {
-          const gate = shouldCallModel(state, tab.tab_id, details.context);
+          const gate = shouldCallModel(state, tab.tab_id, details.context, this.#now());
           if (gate.allowed || options.forceModel || options.forceRefresh) {
-            markModelAttempt(state, tab.tab_id);
+            markModelAttempt(state, tab.tab_id, this.#now());
             if (!this.#dryRun) await persist();
             const stopActivity = await this.#modelActivity?.(tab);
             try {
@@ -358,6 +377,11 @@ export class AutoNameService {
               tabName = suggestion.tab;
               reason = suggestion.reason;
               usedModel = true;
+            } catch (error) {
+              const category = classifyAiFailure(error);
+              markAiFailure(state, category, this.#now());
+              if (!this.#dryRun) await persist();
+              reason = `AI unavailable (${category})`;
             } finally {
               await stopActivity?.();
             }
@@ -442,6 +466,8 @@ interface CompositionOptions {
   env?: NodeJS.ProcessEnv;
   dryRun?: boolean;
   namer?: Namer;
+  aiEnabled?: boolean;
+  now?: () => number;
   modelActivity?: ModelActivity;
   dependencies?: Partial<ServiceDependencies>;
 }
@@ -451,6 +477,8 @@ export function createService({
   env = process.env,
   dryRun = false,
   namer = new AiSdkNamer(env),
+  aiEnabled = explicitAiEnabled(env),
+  now = Date.now,
   modelActivity,
   dependencies = {},
 }: CompositionOptions = {}): AutoNameService {
@@ -461,6 +489,8 @@ export function createService({
     namer,
     env,
     dryRun,
+    aiEnabled,
+    now,
     ...(modelActivity ? { modelActivity } : {}),
     dependencies,
   });

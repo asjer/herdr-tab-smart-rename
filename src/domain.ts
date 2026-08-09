@@ -9,6 +9,21 @@ export interface OwnershipRecord {
   observedLabel?: string | undefined;
 }
 
+export type AiFailureCategory =
+  | "config"
+  | "auth"
+  | "quota"
+  | "network"
+  | "timeout"
+  | "invalid-response"
+  | "unknown";
+
+export interface AiCircuitState {
+  category: AiFailureCategory;
+  failures: number;
+  retryAt: number;
+}
+
 export interface SmartRenameState {
   version: 1;
   workspaces: Record<string, OwnershipRecord>;
@@ -16,6 +31,7 @@ export interface SmartRenameState {
   modelAttempts: Record<string, number>;
   fingerprints: Record<string, string>;
   pendingFingerprints: Record<string, string>;
+  aiCircuit?: AiCircuitState | undefined;
   [key: string]: unknown;
 }
 
@@ -86,6 +102,10 @@ export interface RenameResult {
 export const MAX_TAB_LENGTH = 30;
 export const MAX_CONTEXT_CHARS = 4_500;
 export const MODEL_RATE_MS = 10 * 60 * 1_000;
+const AI_LONG_COOLDOWN_MS = 6 * 60 * 60 * 1_000;
+const AI_INVALID_COOLDOWN_MS = 60 * 60 * 1_000;
+const AI_TRANSIENT_BASE_MS = 5 * 60 * 1_000;
+const AI_TRANSIENT_CAP_MS = 30 * 60 * 1_000;
 
 export function emptyState(): SmartRenameState {
   return {
@@ -383,4 +403,32 @@ export function markModelSuccess(
 ): void {
   state.fingerprints[tabId] = fingerprint(context);
   delete state.pendingFingerprints[tabId];
+  delete state.aiCircuit;
+}
+
+export function aiCircuitAllows(
+  state: SmartRenameState,
+  now = Date.now(),
+): boolean {
+  return !state.aiCircuit || state.aiCircuit.retryAt <= now;
+}
+
+export function markAiFailure(
+  state: SmartRenameState,
+  category: AiFailureCategory,
+  now = Date.now(),
+): void {
+  const previous = state.aiCircuit;
+  const failures = previous?.category === category ? previous.failures + 1 : 1;
+  const cooldown =
+    category === "config" || category === "auth" || category === "quota"
+      ? AI_LONG_COOLDOWN_MS
+      : category === "invalid-response"
+        ? AI_INVALID_COOLDOWN_MS
+        : Math.min(AI_TRANSIENT_CAP_MS, AI_TRANSIENT_BASE_MS * 2 ** Math.min(5, failures - 1));
+  state.aiCircuit = { category, failures, retryAt: now + cooldown };
+}
+
+export function clearAiFailure(state: SmartRenameState): void {
+  delete state.aiCircuit;
 }

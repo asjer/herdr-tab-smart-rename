@@ -1,17 +1,19 @@
 #!/usr/bin/env bun
-import { chmod, closeSync, openSync } from "node:fs";
-import { chmod as chmodAsync, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { type RenameResult } from "./domain.ts";
-import { beginTabProgress, run, snapshot } from "./herdr.ts";
-import { loadNamingPrompt, loadProviderConfig } from "./provider.ts";
+import { beginTabProgress, run, snapshot, snapshotPreflight } from "./herdr.ts";
+import { aiEnabled, loadNamingPrompt, loadProviderConfig } from "./provider.ts";
 import { createService } from "./service.ts";
 import {
   acquireLock,
   ensurePrivateDir,
+  inspectWorker,
+  removeOwnedWorkerPid,
   runtimeStateDir,
   statePaths,
   workerInfo,
+  type WorkerInfo,
+  type WorkerInspection,
 } from "./storage.ts";
 import { sanitizeText } from "./text.ts";
 
@@ -72,47 +74,118 @@ export function currentResultNotice(result: RenameResult | null): {
   };
 }
 
-async function start(): Promise<void> {
-  const stateDir = requireStateDir();
-  await ensurePrivateDir(stateDir);
-  const paths = statePaths(stateDir);
-  const release = await acquireLock(paths.startLock, {
-    timeoutMs: 2_000,
-    staleMs: 30_000,
-  });
-  try {
-    const existing = await workerInfo(paths.pid, workerScript);
-    if (existing) {
-      console.log(`Smart Rename already running (pid ${existing.pid})`);
-      return;
-    }
+interface SpawnedWorker {
+  pid: number;
+  unref(): void;
+}
 
-    const logFd = openSync(paths.log, "a", 0o600);
-    chmod(paths.log, 0o600, () => {});
-    const child = Bun.spawn([process.execPath, workerScript], {
-      cwd: root,
-      env: process.env,
+interface StartWorkerDependencies {
+  preflight(env: NodeJS.ProcessEnv): Promise<void>;
+  inspect(pidFile: string, script: string): Promise<WorkerInspection>;
+  removeOwned(pidFile: string, pid: number, script: string): Promise<void>;
+  spawn(script: string, cwd: string, env: NodeJS.ProcessEnv): SpawnedWorker;
+  sleep(ms: number): Promise<void>;
+  terminate(pid: number): void;
+}
+
+interface StartWorkerOptions {
+  stateDir: string;
+  env?: NodeJS.ProcessEnv;
+  script?: string;
+  cwd?: string;
+  dependencies?: Partial<StartWorkerDependencies>;
+}
+
+const defaultStartDependencies: StartWorkerDependencies = {
+  preflight: snapshotPreflight,
+  inspect: inspectWorker,
+  removeOwned: removeOwnedWorkerPid,
+  spawn: (script, cwd, env) => {
+    const child = Bun.spawn([process.execPath, script], {
+      cwd,
+      env,
       detached: true,
       stdin: "ignore",
-      stdout: logFd,
-      stderr: logFd,
+      stdout: "ignore",
+      stderr: "ignore",
     });
+    return child;
+  },
+  sleep: Bun.sleep,
+  terminate: (pid) => process.kill(pid, "SIGTERM"),
+};
+
+export async function startWorker({
+  stateDir,
+  env = process.env,
+  script = workerScript,
+  cwd = root,
+  dependencies = {},
+}: StartWorkerOptions): Promise<{ info: WorkerInfo; alreadyRunning: boolean }> {
+  await ensurePrivateDir(stateDir);
+  const paths = statePaths(stateDir);
+  const deps = { ...defaultStartDependencies, ...dependencies };
+  const release = await acquireLock(paths.startLock, {
+    timeoutMs: 20_000,
+    staleMs: 60_000,
+  });
+  try {
+    let inspection = await deps.inspect(paths.pid, script);
+    if (inspection.status === "running") {
+      return { info: inspection.info, alreadyRunning: true };
+    }
+    if (inspection.status === "conflict") {
+      throw new Error(`Smart Rename start refused: ${inspection.reason}`);
+    }
+    if (inspection.status === "stale") {
+      await deps.removeOwned(paths.pid, inspection.info.pid, inspection.info.script);
+      inspection = await deps.inspect(paths.pid, script);
+      if (inspection.status !== "missing") {
+        throw new Error("Smart Rename start refused: ownership record changed during stale cleanup");
+      }
+    }
+
+    await deps.preflight(env);
+    const child = deps.spawn(script, cwd, env);
     child.unref();
-    closeSync(logFd);
-    await writeFile(
-      paths.pid,
-      `${JSON.stringify({
-        pid: child.pid,
-        script: workerScript,
-        startedAt: new Date().toISOString(),
-      })}\n`,
-      { mode: 0o600 },
-    );
-    await chmodAsync(paths.pid, 0o600);
-    console.log(`Smart Rename started (pid ${child.pid})`);
+    let ready: WorkerInfo | null = null;
+    try {
+      for (let count = 0; count < 50; count += 1) {
+        await deps.sleep(100);
+        const current = await deps.inspect(paths.pid, script);
+        if (current.status === "running" && current.info.pid === child.pid) {
+          ready = current.info;
+          break;
+        }
+        if (current.status === "conflict" ||
+            (current.status === "running" && current.info.pid !== child.pid)) {
+          throw new Error("Smart Rename start refused: conflicting worker record appeared");
+        }
+      }
+      if (ready) return { info: ready, alreadyRunning: false };
+      throw new Error("Smart Rename worker did not become ready");
+    } finally {
+      if (!ready) {
+        try {
+          deps.terminate(child.pid);
+        } catch {
+          // A child that failed startup may already be gone.
+        }
+        await deps.removeOwned(paths.pid, child.pid, script);
+      }
+    }
   } finally {
     await release();
   }
+}
+
+async function start(): Promise<void> {
+  const result = await startWorker({ stateDir: requireStateDir() });
+  console.log(
+    result.alreadyRunning
+      ? `Smart Rename already running (pid ${result.info.pid})`
+      : `Smart Rename started (pid ${result.info.pid})`,
+  );
 }
 
 async function stop(): Promise<void> {
@@ -136,11 +209,12 @@ async function stop(): Promise<void> {
 async function status(): Promise<void> {
   const paths = statePaths(requireStateDir());
   const info = await workerInfo(paths.pid, workerScript);
+  const mode = aiEnabled(process.env) ? "AI enabled" : "AI disabled";
   if (!info) {
-    console.log("Smart Rename stopped");
+    console.log(`Smart Rename stopped (${mode})`);
     return;
   }
-  console.log(`Smart Rename running (pid ${info.pid}, since ${info.startedAt})`);
+  console.log(`Smart Rename running (pid ${info.pid}, since ${info.startedAt}, ${mode})`);
 }
 
 async function renameAll(): Promise<RenameResult[]> {
@@ -226,6 +300,12 @@ async function configurePrompt(): Promise<void> {
 }
 
 async function checkAi(): Promise<void> {
+  if (!aiEnabled(process.env)) {
+    const summary = "AI disabled; set SMART_RENAME_AI_ENABLED=1 to opt in";
+    await notify("AI disabled", summary);
+    console.log(summary);
+    return;
+  }
   try {
     const config = await loadProviderConfig(process.env);
     await loadNamingPrompt(config, process.env);

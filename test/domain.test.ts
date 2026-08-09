@@ -2,10 +2,12 @@ import { test } from "bun:test";
 import assert from "node:assert/strict";
 import {
   acknowledgeRename,
+  aiCircuitAllows,
   buildModelContext,
   emptyState,
   heuristicTitle,
   isDefaultLabel,
+  markAiFailure,
   markModelAttempt,
   markModelSuccess,
   observeStableContext,
@@ -119,6 +121,40 @@ test("text sanitization delegates ANSI and secret removal to libraries", () => {
   assert.match(output, /redacted/i);
 });
 
+test("provider circuit persists category-specific cooldowns", () => {
+  const state = emptyState();
+  const hour = 60 * 60 * 1_000;
+  for (const category of ["config", "auth", "quota"] as const) {
+    const isolated = emptyState();
+    markAiFailure(isolated, category, 10);
+    assert.equal(isolated.aiCircuit?.retryAt, 10 + 6 * hour);
+  }
+  const invalid = emptyState();
+  markAiFailure(invalid, "invalid-response", 10);
+  assert.equal(invalid.aiCircuit?.retryAt, 10 + hour);
+  const transient = emptyState();
+  const delays: number[] = [];
+  for (let count = 0; count < 5; count += 1) {
+    markAiFailure(transient, "timeout", 10);
+    delays.push(transient.aiCircuit!.retryAt - 10);
+  }
+  assert.deepEqual(delays, [5, 10, 20, 30, 30].map((minutes) => minutes * 60_000));
+  assert.equal(aiCircuitAllows(state, 1_000), true);
+  markAiFailure(state, "network", 1_000);
+  assert.equal(state.aiCircuit?.category, "network");
+  assert.equal(state.aiCircuit?.failures, 1);
+  assert.equal(aiCircuitAllows(state, 1_001), false);
+  assert.equal(aiCircuitAllows(state, state.aiCircuit!.retryAt), true);
+
+  markAiFailure(state, "network", 2_000);
+  assert.equal(state.aiCircuit?.failures, 2);
+  const networkDelay = state.aiCircuit!.retryAt - 2_000;
+  markAiFailure(state, "quota", 3_000);
+  assert.equal(state.aiCircuit?.category, "quota");
+  assert.equal(state.aiCircuit?.failures, 1);
+  assert.ok(state.aiCircuit!.retryAt - 3_000 > networkDelay);
+});
+
 test("stable fingerprints and model cooldown suppress churn", () => {
   const state = emptyState();
   const context: NamingContext = {
@@ -134,7 +170,9 @@ test("stable fingerprints and model cooldown suppress churn", () => {
     shouldCallModel(state, "t1", context, 1_000_000 + MODEL_RATE_MS + 1).allowed,
     true,
   );
+  markAiFailure(state, "network", 1_000_000);
   markModelSuccess(state, "t1", context);
+  assert.equal(state.aiCircuit, undefined);
   assert.equal(
     shouldCallModel(state, "t1", context, 1_000_000 + MODEL_RATE_MS * 2).allowed,
     false,

@@ -1,138 +1,108 @@
 # Semantic map
 
-Smart Rename turns live Herdr activity into stable workspace names and current-task tab names. The code separates naming policy from context collection, provider access, persistence, and runtime control.
+Smart Rename turns Herdr activity into stable workspace and task-tab labels while keeping manual labels authoritative and runtime failures bounded.
 
-## Domain Concepts
+## Domain concepts
 
 | Concept | Meaning | Owner |
 | --- | --- | --- |
-| Workspace identity | Stable project identity from the worktree, existing label, Git root, or pane directory | `domain.ts` |
-| Tab task | The current persistent task, expressed as a 2 to 4 word label | `domain.ts` |
-| Ownership | Whether Smart Rename or the user controls a label | `domain.ts`, `storage.ts` |
-| Expected write | A rename recorded before Herdr applies it, so its event is not mistaken for a manual rename | `domain.ts`, `service.ts` |
-| Rename activity | A guarded `◇ ◈ ◆ ◈` prefix shown only during current-tab model calls | `cli.ts`, `service.ts`, `herdr.ts`, `worker.ts` |
-| Dominant pane | The pane that supplies task evidence: focused agent, active agent, focused command, then first pane | `service.ts` |
-| Naming context | Bounded project, process, terminal, and optional Pi session evidence sent to the namer | `domain.ts`, `herdr.ts`, `pi-context.ts` |
-| Name suggestion | A validated label and reason, or `null` when evidence does not describe a task | `provider.ts` |
-| Rename result | Candidate names, ownership state, model usage, reason, and applied changes | `domain.ts`, `service.ts` |
-| Churn gate | Fingerprints, stability observations, and model cooldowns that prevent repeated calls | `domain.ts` |
-| Provider configuration | Tracked defaults plus private endpoint, model, key, timeout, reasoning, and prompt-path overrides | `provider.env.example`, `provider.ts`, `configure.ts` |
-| Naming prompt | Bundled policy or user-owned instructions reloaded before each model request | `docs/naming-policy.md`, `provider.ts` |
+| Workspace identity | Stable project identity from worktree, existing label, Git root, or pane cwd | `domain.ts` |
+| Tab task | A 2–4 word current-task label | `domain.ts` |
+| Ownership | Manual versus automatic control of a label | `domain.ts`, `storage.ts` |
+| Expected write | Rename intent persisted before Herdr applies it | `domain.ts`, `service.ts` |
+| Dominant pane | Focused agent, active agent, focused command, then first pane | `service.ts` |
+| Pi session label | Existing bounded Pi conversation name; preferred task source | `pi-context.ts`, `domain.ts`, `service.ts` |
+| Deterministic heuristic | Local labels for tests, servers, logs, or remote shells | `domain.ts` |
+| AI opt-in | Explicit `SMART_RENAME_AI_ENABLED=1|true`; keys alone never enable calls | `provider.ts`, `run-bun.sh`, `service.ts` |
+| Provider circuit | Non-secret category, failure count, and retry timestamp | `domain.ts`, `storage.ts`, `service.ts` |
+| Runtime failure | Structured fatal, transient, or generic Herdr command failure | `failure.ts`, `herdr.ts` |
+| Worker ownership | Exact PID/script record published only after child readiness | `storage.ts`, `cli.ts`, `worker.ts` |
+| Coalesced work | Dirty tab set, one rescan flag, latest acknowledgement map | `worker-runtime.ts` |
+| Bounded log | Sanitized/deduplicated active log plus one archive | `worker-log.ts` |
 
-## Technical Layers
+## Technical layers
 
 ```mermaid
 flowchart TB
-    E[CLI, configure pane, worker] --> S[AutoNameService]
+    C[CLI preflight and actions] --> S[AutoNameService]
+    W[Worker entrypoint] --> Q[Coalescing scheduler]
+    Q --> S
     S --> D[Domain policy]
     S --> H[Herdr adapter]
-    S --> P[AI provider]
-    S --> ST[State and locks]
+    S --> P[Explicitly gated provider]
+    S --> ST[Atomic private state]
+    W --> L[Bounded logger]
     H --> PI[Optional Pi context]
-    D --> T[Text sanitization]
-    H --> T
-    P --> T
+    H --> F[Failure classification]
 ```
 
 | Layer | Files | Responsibility |
 | --- | --- | --- |
-| Entrypoints | `cli.ts`, `configure.ts`, `worker.ts` | Translate Herdr actions and events into service calls while filtering owned activity events |
-| Orchestration | `service.ts` | Reconcile ownership, collect context, wrap model calls with optional activity, and apply safe writes |
-| Domain | `domain.ts` | Hold pure naming, ownership, validation, context, and churn rules |
-| Herdr integration | `herdr.ts` | Run Herdr commands, validate snapshots, inspect panes, manage guarded progress labels, and frame socket events |
-| Pi context | `pi-context.ts` | Read bounded user requests from allowed Pi session files |
-| Provider | `provider.ts` | Merge exposed defaults and overrides, reload the naming prompt, call one OpenAI-compatible model, and validate its answer |
-| Persistence | `storage.ts` | Validate state, write atomically, serialize processes, and verify the singleton worker |
-| Text safety | `text.ts` | Strip terminal controls, redact secrets, normalize paths, and bound text |
+| Entrypoints | `cli.ts`, `configure.ts`, `worker.ts` | Translate actions/events, enforce startup and process lifecycle |
+| Runtime control | `worker-runtime.ts`, `worker-log.ts`, `failure.ts`, `subprocess-env.ts` | Coalesce, retry with bounds, fail closed, log with bounds, strip provider secrets from child environments |
+| Orchestration | `service.ts` | Reconcile, collect context, choose naming path, apply safe writes |
+| Domain | `domain.ts` | Pure ownership, labels, heuristics, fingerprints and cooldowns |
+| Herdr integration | `herdr.ts` | Commands, schemas, snapshots, pane evidence, renames, event framing |
+| Provider | `provider.ts` | Opt-in flag, config, sanitized failure category, model output validation |
+| Persistence | `storage.ts` | Per-socket state, locks, atomic files, exact worker identity |
+| Context/text | `pi-context.ts`, `text.ts` | Approved bounded session reads and secret-safe text |
 
-## Cross-Cutting Concerns
+## Runtime paths
 
-- Manual ownership: manual labels stop inspection, provider calls, and writes until reset or explicit reclaim.
-- Bounded data: terminal output, process fields, session windows, provider files, prompts, errors, and notifications all have limits.
-- Secret safety: `strip-ansi` and `secret-sniff` handle common terminal and credential forms before data leaves the machine.
-- Runtime validation: Zod validates Herdr JSON, Pi records, provider configuration, model output, state, locks, and worker metadata.
-- Concurrency: one cross-process state lock covers reconciliation, model gates, expected writes, and rename rollback.
-- Resilience: the worker serializes tasks, debounces tab events, sweeps every 60 seconds, and reconnects after socket closure.
-- Provider independence: Pi supplies optional context only. Model authentication comes from Smart Rename's private provider file.
-- User customization: provider and prompt files reload per request; fixed schemas still reject unsafe or malformed output.
-- Feedback: explicit actions emit start, success, no-change, and sanitized failure notifications.
-- Activity ownership: temporary labels carry an invisible marker, rotate only for `rename-now`, stop on external changes, and restore only the plugin's exact last write.
+### Start
 
-## Data Flow Paths
+1. Acquire the start lock for the hashed Herdr socket state directory.
+2. Return the existing exact worker if present.
+3. Require a successful read-only snapshot preflight.
+4. Spawn without inherited log file descriptors.
+5. Child initializes snapshot/state, arms lifecycle cleanup, and atomically publishes readiness ownership.
+6. Parent confirms the exact child PID before success; live different-script or unverifiable records are non-destructive conflicts.
 
-### Explicit rename
+### Background event
 
-```mermaid
-sequenceDiagram
-    participant U as User
-    participant C as CLI action
-    participant S as AutoNameService
-    participant H as Herdr
-    participant N as Namer
-    participant F as State file
+1. Parse and validate the LF-delimited Herdr event.
+2. Keep only the latest rename acknowledgement per item.
+3. Add a direct tab ID to the dirty set or set the single rescan flag.
+4. One drain handles the bounded pending state.
+5. Fatal Herdr failures invoke one shutdown; transient failures preserve one retry request.
 
-    U->>C: rename-now or rename-all
-    C->>S: evaluate with reclaim and refresh
-    S->>F: lock, load, reconcile
-    S->>H: snapshot and pane evidence
-    alt deterministic process
-        S->>S: choose fixed label
-    else ambiguous task
-        opt current-tab action
-            S->>H: guarded diamond pulse
-        end
-        S->>N: bounded NamingContext
-        N-->>S: NameSuggestion
-        opt current-tab action
-            S->>H: restore original label
-        end
-    end
-    S->>F: persist expected label
-    S->>H: rename workspace or tab
-    H-->>S: rename event
-    S->>F: confirm automatic ownership
-    C-->>U: result notification
-```
+### Evaluation
 
-### Background naming
+1. Reconcile a fresh validated snapshot under the state lock.
+2. Stop early for manual ownership.
+3. Prefer Pi session label, then local heuristic.
+4. If ambiguous, require explicit AI enablement and a closed provider circuit.
+5. On provider failure, persist only cooldown metadata and return no model candidate.
+6. Before a rename, persist the expected label; confirm from the event or roll back on command failure.
 
-1. `worker.ts` subscribes to Herdr lifecycle events.
-2. It resolves the affected tab and debounces evaluation by 400 milliseconds.
-3. `AutoNameService` runs evaluations through one promise queue and one state transaction at a time.
-4. A 60-second sweep catches task changes without lifecycle events.
-5. Fingerprints and cooldowns suppress unchanged model work.
+### Shutdown
 
-### Provider configuration
+- Signal: hold the per-socket start lock, retain ownership while resources quiesce, remove exact ownership, release the lock, and guarantee exit 0 before the hard deadline.
+- Protocol mismatch or missing binary: the same ordered ownership protocol and guaranteed exit 1; a deadline exit intentionally leaves stale ownership rather than a missing live-worker record.
+- No path restarts a Herdr server.
 
-1. `provider.env.example` supplies the tracked OpenAI Luna defaults.
-2. `configure-ai` copies that template to private `provider.env` on first use and opens it in Herdr's overlay pane.
-3. Process values override private-file values; private-file values override the tracked defaults.
-4. `provider.ts` reads at most 16 KiB and validates the merged configuration with Zod.
-5. It loads an explicit prompt path, private `naming-prompt.md`, or bundled `docs/naming-policy.md` in that order.
-6. The AI SDK sends one non-streaming OpenAI-compatible request.
+## Data boundaries
 
-### Prompt customization
+| Boundary | Validation/bound | Durable output |
+| --- | --- | --- |
+| Herdr command | streaming stdout/stderr caps, secret-stripped environment, structured code precedence | typed result or metadata-bearing `HerdrRuntimeError` |
+| Snapshot/process/event | JSON plus Zod schemas | trusted Herdr structures |
+| Event queue | sets, one flag, latest-value map | bounded in-memory pending work |
+| Pi session | approved root/regular file and bounded sampling | sanitized timeline |
+| Provider config | 16 KiB dotenv plus Zod | in-memory config only |
+| Model context | sanitization and 4,500-char cap | request payload only when opted in |
+| Provider failure | category classification and sanitized detail | category/count/retryAt only |
+| State | Zod, cross-process lock, atomic rename | private version-1 JSON |
+| Worker identity | exact PID/script, atomic rename | private `worker.json` after readiness |
+| Worker log | 800-char lines, dedupe, symlink rejection, true 5 MiB byte cap | mode-`0600` active + one archive |
 
-1. `configure-prompt` copies the bundled naming policy to private `naming-prompt.md` on first use.
-2. `SMART_RENAME_PROMPT_PATH` may select another absolute or config-relative file.
-3. The selected prompt is limited to 32 KiB and reloaded before every request.
-4. The model response must still pass JSON, Zod, and label-policy validation.
+## Invariants
 
-## Data Boundaries and Transformations
-
-| Boundary | Input | Transformation | Output |
-| --- | --- | --- | --- |
-| Herdr snapshot | CLI JSON | JSON parse and Zod validation | `HerdrSnapshot` |
-| Herdr event socket | LF-delimited envelopes | framing, JSON parse, normalization, Zod validation | `HerdrEvent` |
-| Pane process | Herdr process-info JSON | field selection, sanitization, length limits | `ProcessInfo` |
-| Pane output | recent terminal text | ANSI removal, secret redaction, whitespace normalization, 1,000-character cap | safe output evidence |
-| Pi session | path-backed JSONL | root check, regular-file check, bounded head/middle/tail windows, user-message validation | `SessionTimeline` |
-| Provider files | tracked and private dotenv text | 16 KiB bounds, dotenv parse, precedence merge, provider-specific key selection, Zod validation | `ProviderConfig` |
-| Naming prompt | bundled policy, private copy, or configured path | precedence selection, 32 KiB bound, non-empty check | system instruction text |
-| Model context | pane evidence | dominant-pane selection, sanitization, timeline weighting, 4,500-character hard cap | `NamingContext` |
-| Model response | provider text | JSON fence removal, JSON parse, Zod validation, title policy | `NameSuggestion` |
-| State file | JSON on disk | lock, Zod validation, reconciliation, atomic temporary-file rename | `SmartRenameState` |
-| Progress label | current tab label | invisible marker, one-cell diamond frame, exact-label guard | transient prefixed label or original label |
-| Herdr rename | candidate label | expected-write persistence before command | confirmed automatic ownership or rollback |
-
-Updated-at: 7e32aa2d5e70910bedbadb0e06dcdfde50767317
+- Manual labels win until explicitly reclaimed.
+- AI is never inferred from a key or provider file alone.
+- Provider failure never becomes worker failure.
+- Protocol mismatch and missing Herdr binary never retry indefinitely.
+- Worker count is zero when disabled and exactly one per enabled socket.
+- A burst cannot grow pending work proportionally.
+- Logs and state contain no secrets or raw provider responses.
+- Rollback stops or leaves off the worker; it never restarts Herdr.

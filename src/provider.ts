@@ -5,6 +5,7 @@ import { generateText } from "ai";
 import { parse as parseEnv } from "dotenv";
 import { z } from "zod";
 import {
+  type AiFailureCategory,
   type NameSuggestion,
   type NamingContext,
   validateTabLabel,
@@ -37,14 +38,40 @@ const ProviderConfigSchema = z.object({
 });
 
 const ModelOutputSchema = z.object({
-  tab: z.string().nullable(),
-  reason: z.string(),
+  tab: z.string().max(120).nullable(),
+  reason: z.string().max(256),
 });
 
 export type ProviderConfig = z.infer<typeof ProviderConfigSchema>;
 
 export interface Namer {
   suggest(context: NamingContext): Promise<NameSuggestion>;
+}
+
+export class AiProviderError extends Error {
+  readonly category: AiFailureCategory;
+
+  constructor(category: AiFailureCategory, message: string, options: { cause?: unknown } = {}) {
+    super(sanitizeText(message).slice(0, 500) || "AI provider failed", options);
+    this.name = "AiProviderError";
+    this.category = category;
+  }
+}
+
+export function aiEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  return /^(?:1|true)$/i.test(env.SMART_RENAME_AI_ENABLED?.trim() ?? "");
+}
+
+export function classifyAiFailure(error: unknown): AiFailureCategory {
+  if (error instanceof AiProviderError) return error.category;
+  const message = error instanceof Error ? error.message : String(error ?? "");
+  if (/AI key missing|configuration is invalid|must be .*URL|required|provider\.env.*missing/i.test(message)) return "config";
+  if (/\b(?:401|403)\b|unauthori[sz]ed|authentication|invalid api key|permission denied/i.test(message)) return "auth";
+  if (/no credits|insufficient_quota|billing|quota|\b(?:402|429)\b|rate.?limit/i.test(message)) return "quota";
+  if (/timed out|timeout|abort(?:ed|error)/i.test(message)) return "timeout";
+  if (/\b(?:ECONNREFUSED|ECONNRESET|ENETUNREACH|EAI_AGAIN)\b|cannot connect|network|fetch failed/i.test(message)) return "network";
+  if (/invalid model tab label|JSON|Zod|parse|model output|too_big|expected string|maximum/i.test(message)) return "invalid-response";
+  return "unknown";
 }
 
 export function providerEnvPath(env: NodeJS.ProcessEnv = process.env): string | null {
@@ -226,18 +253,21 @@ export async function loadNamingPrompt(
 }
 
 function parseSuggestion(text: string): NameSuggestion {
+  if (Buffer.byteLength(text) > 4 * 1024) {
+    throw new Error("model output exceeded byte limit");
+  }
   const cleaned = text
     .replace(/^```(?:json)?\s*/i, "")
     .replace(/\s*```$/i, "")
     .trim();
   const output = ModelOutputSchema.parse(JSON.parse(cleaned));
   if (output.tab === null) {
-    return { tab: null, reason: sanitizeText(output.reason) };
+    return { tab: null, reason: "AI found no meaningful task" };
   }
   if (!validateTabLabel(output.tab)) {
     throw new Error(`invalid model tab label: ${JSON.stringify(output.tab)}`);
   }
-  return { tab: sanitizeText(output.tab), reason: sanitizeText(output.reason) };
+  return { tab: sanitizeText(output.tab), reason: "AI suggestion" };
 }
 
 function safeProviderError(error: unknown, config: ProviderConfig): string {
@@ -250,7 +280,7 @@ export interface CompletionRequest {
   config: ProviderConfig;
   context: NamingContext;
   system: string;
-  maxOutputTokens: 32_768;
+  maxOutputTokens: 256;
   maxRetries: 1;
   abortSignal: AbortSignal;
 }
@@ -296,21 +326,29 @@ export class AiSdkNamer implements Namer {
   }
 
   async suggest(context: NamingContext): Promise<NameSuggestion> {
-    const config = await loadProviderConfig(this.#env);
-    const system = await loadNamingPrompt(config, this.#env);
+    let config: ProviderConfig | undefined;
     try {
+      config = await loadProviderConfig(this.#env);
+      const system = await loadNamingPrompt(config, this.#env);
       const text = await this.#complete({
         config,
         context,
         system,
-        maxOutputTokens: 32_768,
+        maxOutputTokens: 256,
         maxRetries: 1,
         abortSignal: AbortSignal.timeout(config.timeoutMs),
       });
       return parseSuggestion(text);
     } catch (error) {
-      throw new Error(
-        `AI request failed (${config.provider}/${config.model}): ${safeProviderError(error, config)}`,
+      const category = classifyAiFailure(error);
+      const detail = config
+        ? safeProviderError(error, config)
+        : sanitizeText(error instanceof Error ? error.message : String(error)).slice(0, 400);
+      const provider = config ? `${config.provider}/${config.model}` : "configuration";
+      throw new AiProviderError(
+        category,
+        `AI request failed (${provider}, ${category}): ${detail || "provider request failed"}`,
+        { cause: error },
       );
     }
   }

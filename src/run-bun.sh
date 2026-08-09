@@ -5,8 +5,23 @@ set -eu
 # is invoked from the command palette, re-enter through the private 1Password
 # wrapper so the API key is available only to this process tree.
 command_name="${2:-}"
-case "$command_name" in
-  start|check-ai|rename-now|all|reset-tab|reset-workspace)
+ai_enabled="${SMART_RENAME_AI_ENABLED:-}"
+if [ -z "$ai_enabled" ] && [ -n "${HERDR_PLUGIN_CONFIG_DIR:-}" ]; then
+  provider_file="$HERDR_PLUGIN_CONFIG_DIR/provider.env"
+  if [ -f "$provider_file" ] && grep -Eiq '^[[:space:]]*SMART_RENAME_AI_ENABLED[[:space:]]*=[[:space:]]*(1|true)[[:space:]]*$' "$provider_file"; then
+    ai_enabled=1
+    export SMART_RENAME_AI_ENABLED=1
+  fi
+fi
+case "$ai_enabled" in
+  1|[Tt][Rr][Uu][Ee])
+    ai_enabled=1
+    export SMART_RENAME_AI_ENABLED=1
+    ;;
+esac
+
+case "$command_name:$ai_enabled" in
+  start:1|check-ai:1|rename-now:1|all:1|reset-tab:1|reset-workspace:1)
     if [ -z "${SMART_RENAME_API_KEY:-}" ] && [ -n "${HERDR_PLUGIN_CONFIG_DIR:-}" ]; then
       secret_wrapper="$HERDR_PLUGIN_CONFIG_DIR/run-with-1password.sh"
       if [ -x "$secret_wrapper" ]; then

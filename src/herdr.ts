@@ -1,6 +1,13 @@
 import net, { type Socket } from "node:net";
 import { z } from "zod";
 import { type PaneContext } from "./domain.ts";
+import {
+  classifyHerdrFailure,
+  CommandExecutionError,
+  HerdrRuntimeError,
+  isFatalHerdrFailure,
+} from "./failure.ts";
+import { nonProviderSubprocessEnv } from "./subprocess-env.ts";
 import { sampledUserMessages } from "./pi-context.ts";
 import { boundedText } from "./text.ts";
 
@@ -71,17 +78,18 @@ const ProcessResponseSchema = z.object({
   }),
 });
 
+const EventIdSchema = z.string().min(1).max(256);
 const EventEnvelopeSchema = z.object({
-  event: z.string(),
+  event: z.string().min(1).max(128),
   data: z.looseObject({
-    type: z.string().optional(),
-    workspace_id: z.string().optional(),
-    tab_id: z.string().optional(),
-    pane_id: z.string().optional(),
-    label: z.string().optional(),
-    workspace: z.object({ workspace_id: z.string().optional() }).optional(),
-    tab: z.object({ tab_id: z.string().optional() }).optional(),
-    pane: z.object({ tab_id: z.string().optional() }).optional(),
+    type: z.string().max(128).optional(),
+    workspace_id: EventIdSchema.optional(),
+    tab_id: EventIdSchema.optional(),
+    pane_id: EventIdSchema.optional(),
+    label: z.string().max(256).optional(),
+    workspace: z.object({ workspace_id: EventIdSchema.optional() }).optional(),
+    tab: z.object({ tab_id: EventIdSchema.optional() }).optional(),
+    pane: z.object({ tab_id: EventIdSchema.optional() }).optional(),
   }),
 });
 
@@ -131,37 +139,158 @@ interface RunOptions {
   env?: NodeJS.ProcessEnv;
 }
 
+interface BoundedStreamResult {
+  text: string;
+  overflow: boolean;
+}
+
+async function readBoundedStream(
+  stream: ReadableStream<Uint8Array>,
+  maxBytes: number,
+  onOverflow: () => void,
+): Promise<BoundedStreamResult> {
+  const reader = stream.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  let overflow = false;
+  try {
+    while (true) {
+      const item = await reader.read();
+      if (item.done) break;
+      const remaining = Math.max(0, maxBytes - total);
+      if (item.value.byteLength > remaining) {
+        if (remaining) chunks.push(item.value.slice(0, remaining));
+        total = maxBytes;
+        overflow = true;
+        onOverflow();
+        break;
+      }
+      chunks.push(item.value);
+      total += item.value.byteLength;
+    }
+  } finally {
+    await reader.cancel().catch(() => {});
+    reader.releaseLock();
+  }
+  return { text: new TextDecoder().decode(Buffer.concat(chunks)), overflow };
+}
+
 export async function run(
   command: string,
   args: string[],
   options: RunOptions = {},
 ): Promise<string> {
-  const child = Bun.spawn([command, ...args], {
-    env: options.env ?? process.env,
-    stdout: "pipe",
-    stderr: "pipe",
-  });
+  const maxBytes = options.maxBuffer ?? 2 * 1024 * 1024;
+  const timeoutMs = options.timeout ?? 10_000;
+  let child: Bun.Subprocess<"ignore", "pipe", "pipe">;
+  try {
+    child = Bun.spawn({
+      cmd: [command, ...args],
+      env: nonProviderSubprocessEnv(options.env ?? process.env),
+      stdin: "ignore",
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+  } catch (error) {
+    const spawnCode = error && typeof error === "object" && "code" in error
+      ? String(error.code)
+      : undefined;
+    throw new CommandExecutionError(`${command} failed to spawn`, {
+      command,
+      spawnCode,
+    }, { cause: error });
+  }
+
   let timedOut = false;
+  let overflowStream: "stdout" | "stderr" | undefined;
+  const terminate = (stream?: "stdout" | "stderr"): void => {
+    overflowStream ??= stream;
+    try {
+      child.kill();
+    } catch {
+      // The child may already have exited.
+    }
+  };
   const timer = setTimeout(() => {
     timedOut = true;
-    child.kill();
-  }, options.timeout ?? 10_000);
+    terminate();
+  }, timeoutMs);
+
+  let hardTimer: ReturnType<typeof setTimeout> | undefined;
   try {
-    const [stdout, stderr, exitCode] = await Promise.all([
-      new Response(child.stdout).text(),
-      new Response(child.stderr).text(),
-      child.exited,
+    const outputPromise = Promise.all([
+      readBoundedStream(child.stdout, maxBytes, () => terminate("stdout")),
+      readBoundedStream(child.stderr, maxBytes, () => terminate("stderr")),
     ]);
-    if (timedOut) throw new Error(`${command} timed out`);
+    const [stdoutResult, stderrResult] = await Promise.race([
+      outputPromise,
+      new Promise<never>((_, reject) => {
+        hardTimer = setTimeout(
+          () => reject(new Error(`${command} did not terminate after kill`)),
+          timeoutMs + 1_500,
+        );
+      }),
+    ]);
+    let exitCode = await Promise.race([
+      child.exited,
+      Bun.sleep(750).then(() => {
+        try { child.kill("SIGKILL"); } catch {}
+        return -1;
+      }),
+    ]);
+    if (exitCode === -1) {
+      exitCode = await Promise.race([child.exited, Bun.sleep(750).then(() => -1)]);
+    }
+    const stdout = stdoutResult.text.trim();
+    const stderr = stderrResult.text.trim();
+    const metadata = {
+      command,
+      exitCode,
+      stdout,
+      stderr,
+      timedOut,
+      overflowStream,
+    };
+    if (timedOut) throw new CommandExecutionError(`${command} timed out`, metadata);
+    if (stdoutResult.overflow || stderrResult.overflow) {
+      throw new CommandExecutionError(
+        `${command} ${overflowStream ?? "output"} exceeded buffer`,
+        metadata,
+      );
+    }
     if (exitCode !== 0) {
-      throw new Error(stderr.trim() || `${command} exited ${exitCode}`);
+      throw new CommandExecutionError(
+        stderr || stdout || `${command} exited ${exitCode}`,
+        metadata,
+      );
     }
-    if (Buffer.byteLength(stdout) > (options.maxBuffer ?? 2 * 1024 * 1024)) {
-      throw new Error(`${command} output exceeded buffer`);
-    }
-    return stdout.trim();
+    return stdout;
+  } catch (error) {
+    if (error instanceof CommandExecutionError) throw error;
+    try { child.kill("SIGKILL"); } catch {}
+    throw new CommandExecutionError(
+      timedOut
+        ? `${command} timed out`
+        : overflowStream
+          ? `${command} ${overflowStream} exceeded buffer`
+          : `${command} failed while reading output`,
+      { command, timedOut, overflowStream },
+      { cause: error },
+    );
   } finally {
     clearTimeout(timer);
+    if (hardTimer) clearTimeout(hardTimer);
+  }
+}
+
+export async function herdrRun(
+  args: string[],
+  env: NodeJS.ProcessEnv = process.env,
+): Promise<string> {
+  try {
+    return await run(env.HERDR_BIN_PATH || "herdr", args, { env });
+  } catch (error) {
+    throw classifyHerdrFailure(error);
   }
 }
 
@@ -169,7 +298,22 @@ async function herdrJson(
   args: string[],
   env: NodeJS.ProcessEnv = process.env,
 ): Promise<unknown> {
-  return JSON.parse(await run(env.HERDR_BIN_PATH || "herdr", args, { env }));
+  const output = await herdrRun(args, env);
+  try {
+    const parsed: unknown = JSON.parse(output);
+    if (parsed && typeof parsed === "object" && "error" in parsed) {
+      throw classifyHerdrFailure(JSON.stringify(parsed));
+    }
+    return parsed;
+  } catch (error) {
+    throw classifyHerdrFailure(error);
+  }
+}
+
+export async function snapshotPreflight(
+  env: NodeJS.ProcessEnv = process.env,
+): Promise<void> {
+  await snapshot(env);
 }
 
 export async function snapshot(
@@ -185,7 +329,7 @@ export async function rename(
   label: string,
   env: NodeJS.ProcessEnv = process.env,
 ): Promise<void> {
-  await run(env.HERDR_BIN_PATH || "herdr", [kind, "rename", id, label], { env });
+  await herdrRun([kind, "rename", id, label], env);
 }
 
 export async function beginTabProgress(
@@ -263,14 +407,14 @@ async function paneRecent(
 ): Promise<string> {
   try {
     return boundedText(
-      await run(
-        env.HERDR_BIN_PATH || "herdr",
+      await herdrRun(
         ["pane", "read", paneId, "--source", "recent-unwrapped", "--lines", "12"],
-        { env },
+        env,
       ),
       1_000,
     );
-  } catch {
+  } catch (error) {
+    if (isFatalHerdrFailure(error)) throw error;
     return "";
   }
 }
@@ -290,7 +434,8 @@ async function paneProcess(
       command: boundedText(item.cmdline ?? item.argv?.join(" ") ?? "", 500),
       cwd: boundedText(item.cwd, 200),
     };
-  } catch {
+  } catch (error) {
+    if (isFatalHerdrFailure(error)) throw error;
     return null;
   }
 }
@@ -346,12 +491,56 @@ export function normalizeHerdrEvent(message: unknown): HerdrEvent | null {
   };
 }
 
+export const MAX_EVENT_LINE_BYTES = 64 * 1024;
+
+export class HerdrEventFramer {
+  #buffer = "";
+
+  push(chunk: string): { events: HerdrEvent[]; failure?: HerdrRuntimeError } {
+    this.#buffer += chunk;
+    const events: HerdrEvent[] = [];
+    let index: number;
+    while ((index = this.#buffer.indexOf("\n")) !== -1) {
+      const rawLine = this.#buffer.slice(0, index);
+      this.#buffer = this.#buffer.slice(index + 1);
+      if (Buffer.byteLength(rawLine) > MAX_EVENT_LINE_BYTES) {
+        this.#buffer = "";
+        return {
+          events,
+          failure: new HerdrRuntimeError("transient", "Herdr event frame exceeded byte limit"),
+        };
+      }
+      const line = rawLine.endsWith("\r") ? rawLine.slice(0, -1) : rawLine;
+      try {
+        const message: unknown = JSON.parse(line);
+        if (message && typeof message === "object" && "error" in message) {
+          this.#buffer = "";
+          return { events, failure: classifyHerdrFailure(JSON.stringify(message)) };
+        }
+        const event = normalizeHerdrEvent(message);
+        if (event) events.push(event);
+      } catch {
+        // Malformed complete frames are ignored; close/reconnect handles stream damage.
+      }
+    }
+    if (Buffer.byteLength(this.#buffer) > MAX_EVENT_LINE_BYTES) {
+      this.#buffer = "";
+      return {
+        events,
+        failure: new HerdrRuntimeError("transient", "Herdr partial event frame exceeded byte limit"),
+      };
+    }
+    return { events };
+  }
+}
+
 export function subscribe(
   socketPath: string,
   onEvent: (event: HerdrEvent) => void,
+  onFailure: (error: HerdrRuntimeError) => void = () => {},
 ): Socket {
   const socket = net.createConnection(socketPath);
-  let buffer = "";
+  const framer = new HerdrEventFramer();
   socket.setEncoding("utf8");
   socket.on("connect", () => {
     socket.write(
@@ -365,18 +554,11 @@ export function subscribe(
     );
   });
   socket.on("data", (chunk: string) => {
-    buffer += chunk;
-    let index: number;
-    while ((index = buffer.indexOf("\n")) !== -1) {
-      const rawLine = buffer.slice(0, index);
-      buffer = buffer.slice(index + 1);
-      const line = rawLine.endsWith("\r") ? rawLine.slice(0, -1) : rawLine;
-      try {
-        const event = normalizeHerdrEvent(JSON.parse(line));
-        if (event) onEvent(event);
-      } catch {
-        // Reconnect handles malformed streams.
-      }
+    const result = framer.push(chunk);
+    for (const event of result.events) onEvent(event);
+    if (result.failure) {
+      onFailure(result.failure);
+      socket.destroy();
     }
   });
   return socket;
