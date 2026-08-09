@@ -1,21 +1,29 @@
 #!/usr/bin/env bun
-import { appendFile, chmod } from "node:fs/promises";
+import { fileURLToPath } from "node:url";
 import { type Socket } from "node:net";
 import {
   snapshot,
   subscribe,
   tabProgressBase,
   type HerdrEvent,
-  type HerdrSnapshot,
 } from "./herdr.ts";
 import { createService } from "./service.ts";
 import {
   ensurePrivateDir,
-  removeOwnedWorkerPid,
+  runtimeStateDir,
   statePaths,
+  WorkerShutdownOwnership,
+  writeWorkerInfo,
 } from "./storage.ts";
+import { createWorkerLogger } from "./worker-log.ts";
+import {
+  CoalescingScheduler,
+  ReconnectController,
+  WorkerShutdown,
+} from "./worker-runtime.ts";
 
 export const SWEEP_INTERVAL_MS = 60_000;
+const workerScript = fileURLToPath(import.meta.url);
 
 export function shouldIgnoreProgressRename(
   progressBases: Map<string, string>,
@@ -35,90 +43,77 @@ export function shouldIgnoreProgressRename(
 export async function runWorker(
   env: NodeJS.ProcessEnv = process.env,
 ): Promise<void> {
-  const stateDir = env.HERDR_PLUGIN_STATE_DIR;
-  if (!stateDir) throw new Error("HERDR_PLUGIN_STATE_DIR is required");
+  const stateRoot = env.HERDR_PLUGIN_STATE_DIR;
+  if (!stateRoot) throw new Error("HERDR_PLUGIN_STATE_DIR is required");
+  const socketPath = env.HERDR_SOCKET_PATH;
+  if (!socketPath) throw new Error("HERDR_SOCKET_PATH is required");
+
+  const stateDir = runtimeStateDir(stateRoot, socketPath);
   await ensurePrivateDir(stateDir);
   const paths = statePaths(stateDir);
+  const logger = createWorkerLogger({ file: paths.log, archive: paths.logArchive });
   const service = createService({ stateDir, env });
+  const shutdownOwnership = new WorkerShutdownOwnership({
+    startLock: paths.startLock,
+    pidFile: paths.pid,
+    pid: process.pid,
+    script: workerScript,
+  });
 
-  const log = async (message: string): Promise<void> => {
-    await appendFile(paths.log, `${new Date().toISOString()} ${message}\n`, {
-      mode: 0o600,
-    }).catch(() => {});
-    await chmod(paths.log, 0o600).catch(() => {});
-  };
-
+  // Initialization is the child-side readiness check.
   await service.initialize();
 
   let socket: Socket | null = null;
-  let stopped = false;
-  let reconnectTimer: ReturnType<typeof setTimeout> | undefined;
   let sweepTimer: ReturnType<typeof setInterval> | undefined;
-  let work = Promise.resolve();
-  let sweepQueued = false;
-  const timers = new Map<string, ReturnType<typeof setTimeout>>();
+  let stopped = false;
   const progressBases = new Map<string, string>();
+  let lifecycle: WorkerShutdown;
+  let connect: () => void;
+  const reconnect = new ReconnectController({ connect: () => connect() });
 
-  const enqueue = (task: () => Promise<void>): Promise<void> => {
-    work = work
-      .then(task, task)
-      .catch((error: unknown) => log(`task failed: ${errorMessage(error)}`));
-    return work;
-  };
-
-  const evaluate = async (
-    tabId: string | undefined,
-    current?: HerdrSnapshot,
-  ): Promise<void> => {
-    if (!tabId || stopped) return;
-    const result = await service.evaluate(
-      tabId,
-      current ? { snapshot: current } : {},
-    );
-    if (result?.changes.length) {
-      await log(`renamed ${JSON.stringify(result.changes)}`);
-    }
-  };
-
-  const schedule = (tabId: string | undefined, delay = 400): void => {
-    if (!tabId || stopped) return;
-    const previous = timers.get(tabId);
-    if (previous) clearTimeout(previous);
-    const timer = setTimeout(() => {
-      timers.delete(tabId);
-      enqueue(() => evaluate(tabId));
-    }, delay);
-    timers.set(tabId, timer);
-  };
-
-  const sweep = async (): Promise<void> => {
-    if (stopped) return;
-    const current = await snapshot(env);
-    for (const tab of current.tabs) await evaluate(tab.tab_id);
-  };
-
-  const queueSweep = (): void => {
-    if (stopped || sweepQueued) return;
-    sweepQueued = true;
-    enqueue(async () => {
-      try {
-        await sweep();
-      } finally {
-        sweepQueued = false;
+  const scheduler = new CoalescingScheduler({
+    scan: async () => (await snapshot(env)).tabs.map((tab) => tab.tab_id),
+    evaluate: async (tabId) => {
+      const result = await service.evaluate(tabId);
+      if (result?.changes.length) {
+        await logger.log(`renamed ${JSON.stringify(result.changes)}`);
       }
-    });
+    },
+    acknowledge: (item) => service.acknowledge(item.kind, item.id, item.label),
+    onError: (error) => logger.log(`task deferred: ${errorMessage(error)}`),
+    onFatal: (error) => lifecycle.fatal(error),
+  });
+
+  const stopResources = async (): Promise<void> => {
+    await shutdownOwnership.begin();
+    stopped = true;
+    reconnect.stop();
+    if (sweepTimer) clearInterval(sweepTimer);
+    socket?.destroy();
+    socket = null;
+    await scheduler.stop();
   };
 
-  const handleEvent = async (event: HerdrEvent): Promise<void> => {
+  lifecycle = new WorkerShutdown({
+    logger,
+    stopResources,
+    removeOwnership: () => shutdownOwnership.finish(),
+    exit: (code) => process.exit(code),
+  });
+
+  const handleEvent = (event: HerdrEvent): void => {
+    reconnect.validEvent();
     if (event.type === "workspace_renamed" && event.workspace_id && event.label) {
-      await service.acknowledge("workspace", event.workspace_id, event.label);
+      scheduler.requestAcknowledgement({
+        kind: "workspace",
+        id: event.workspace_id,
+        label: event.label,
+      });
       return;
     }
     if (event.type === "tab_renamed" && event.tab_id && event.label) {
-      if (shouldIgnoreProgressRename(progressBases, event.tab_id, event.label)) {
-        return;
-      }
-      await service.acknowledge("tab", event.tab_id, event.label);
+      if (shouldIgnoreProgressRename(progressBases, event.tab_id, event.label)) return;
+      scheduler.requestAcknowledgement({ kind: "tab", id: event.tab_id, label: event.label });
       return;
     }
     if (event.type === "tab_closed") {
@@ -127,79 +122,49 @@ export async function runWorker(
     }
     if (event.type === "workspace_closed") return;
 
-    const current = await snapshot(env);
-    const pane = event.pane_id
-      ? current.panes.find((item) => item.pane_id === event.pane_id)
-      : undefined;
-    const workspaceId =
-      event.workspace_id || event.workspace?.workspace_id || pane?.workspace_id;
-    const workspace = workspaceId
-      ? current.workspaces.find((item) => item.workspace_id === workspaceId)
-      : undefined;
-    const tabId =
-      event.tab_id ||
-      event.tab?.tab_id ||
-      event.pane?.tab_id ||
-      pane?.tab_id ||
-      workspace?.active_tab_id;
-    schedule(tabId);
+    const directTabId = event.tab_id || event.tab?.tab_id || event.pane?.tab_id;
+    if (directTabId) scheduler.requestTab(directTabId);
+    else scheduler.requestRescan();
   };
 
-  const scheduleReconnect = (delay: number): void => {
-    if (stopped || reconnectTimer) return;
-    reconnectTimer = setTimeout(() => {
-      reconnectTimer = undefined;
-      connect();
-    }, delay);
-  };
-
-  const connect = (): void => {
+  connect = (): void => {
     if (stopped) return;
-    const socketPath = env.HERDR_SOCKET_PATH;
-    if (!socketPath) {
-      void log("HERDR_SOCKET_PATH is required; retrying");
-      scheduleReconnect(5_000);
-      return;
-    }
-    const connection = subscribe(socketPath, (event) => {
-      enqueue(() => handleEvent(event));
-    });
-    socket = connection;
-    connection.on("error", (error) => void log(`socket error: ${error.message}`));
-    connection.on("close", () => {
-      if (socket !== connection) return;
-      socket = null;
-      scheduleReconnect(1_000);
-    });
-  };
-
-  const shutdown = async (signal: string): Promise<void> => {
-    if (stopped) return;
-    stopped = true;
-    if (reconnectTimer) clearTimeout(reconnectTimer);
-    if (sweepTimer) clearInterval(sweepTimer);
-    for (const timer of timers.values()) clearTimeout(timer);
-    socket?.destroy();
-    await work.catch(() => {});
-    await removeOwnedWorkerPid(paths.pid, process.pid);
-    await log(`stopped by ${signal}`);
-    process.exit(0);
-  };
-
-  process.on("SIGTERM", () => void shutdown("SIGTERM"));
-  process.on("SIGINT", () => void shutdown("SIGINT"));
-  process.on("uncaughtException", (error) => {
-    void log(`fatal: ${error.stack ?? error}`).then(() => shutdown("error"));
-  });
-  process.on("unhandledRejection", (error) => {
-    void log(`fatal rejection: ${errorMessage(error)}`).then(() =>
-      shutdown("error"),
+    const connection = subscribe(
+      socketPath,
+      handleEvent,
+      (error) => {
+        if (error.fatal) {
+          reconnect.stop();
+          void lifecycle.fatal(error);
+        }
+        else void logger.log(`socket response error: ${error.message}`);
+      },
     );
-  });
+    socket = connection;
+    connection.on("error", (error) => {
+      void logger.log(`socket error: ${errorMessage(error)}`);
+    });
+    connection.on("close", () => {
+      if (socket !== connection || stopped) return;
+      socket = null;
+      reconnect.closed();
+    });
+  };
 
-  await log(`started pid=${process.pid}`);
-  queueSweep();
-  sweepTimer = setInterval(queueSweep, SWEEP_INTERVAL_MS);
+  process.once("SIGTERM", () => void lifecycle.signal("SIGTERM"));
+  process.once("SIGINT", () => void lifecycle.signal("SIGINT"));
+  process.once("uncaughtException", (error) => void lifecycle.fatal(error));
+  process.once("unhandledRejection", (error) => void lifecycle.fatal(error));
+
+  // Publish readiness only after lifecycle handlers and cleanup are armed.
+  await writeWorkerInfo(paths.pid, {
+    pid: process.pid,
+    script: workerScript,
+    startedAt: new Date().toISOString(),
+  });
+  await logger.log(`started pid=${process.pid}`);
+  scheduler.requestRescan();
+  sweepTimer = setInterval(() => scheduler.requestRescan(), SWEEP_INTERVAL_MS);
   connect();
 }
 

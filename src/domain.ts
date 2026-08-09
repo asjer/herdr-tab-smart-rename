@@ -9,6 +9,21 @@ export interface OwnershipRecord {
   observedLabel?: string | undefined;
 }
 
+export type AiFailureCategory =
+  | "config"
+  | "auth"
+  | "quota"
+  | "network"
+  | "timeout"
+  | "invalid-response"
+  | "unknown";
+
+export interface AiCircuitState {
+  category: AiFailureCategory;
+  failures: number;
+  retryAt: number;
+}
+
 export interface SmartRenameState {
   version: 1;
   workspaces: Record<string, OwnershipRecord>;
@@ -16,6 +31,7 @@ export interface SmartRenameState {
   modelAttempts: Record<string, number>;
   fingerprints: Record<string, string>;
   pendingFingerprints: Record<string, string>;
+  aiCircuit?: AiCircuitState | undefined;
   [key: string]: unknown;
 }
 
@@ -26,6 +42,7 @@ export interface ProcessInfo {
 }
 
 export interface SessionTimeline {
+  name?: string;
   origin: string[];
   middle: string[];
   recent: string[];
@@ -85,6 +102,10 @@ export interface RenameResult {
 export const MAX_TAB_LENGTH = 30;
 export const MAX_CONTEXT_CHARS = 4_500;
 export const MODEL_RATE_MS = 10 * 60 * 1_000;
+const AI_LONG_COOLDOWN_MS = 6 * 60 * 60 * 1_000;
+const AI_INVALID_COOLDOWN_MS = 60 * 60 * 1_000;
+const AI_TRANSIENT_BASE_MS = 5 * 60 * 1_000;
+const AI_TRANSIENT_CAP_MS = 30 * 60 * 1_000;
 
 export function emptyState(): SmartRenameState {
   return {
@@ -109,6 +130,12 @@ export function reconcileItem(
 ): OwnershipRecord {
   const next = { ...record };
   const previousObserved = next.observedLabel;
+  // Herdr reuses workspace/tab IDs after items are closed. A numeric default
+  // label therefore represents an auto-nameable item even when stale state
+  // for that ID contains an earlier automatic or manual title.
+  if (eligible) {
+    return { manual: false, observedLabel: currentLabel };
+  }
   if (next.expectedLabel) {
     if (currentLabel === next.expectedLabel) {
       next.autoLabel = currentLabel;
@@ -178,6 +205,15 @@ export function titleCase(input: unknown): string {
         : word[0]!.toUpperCase() + word.slice(1).toLowerCase(),
     )
     .join(" ");
+}
+
+export function sessionTabLabel(name: unknown): string | null {
+  const value = sanitizeText(name);
+  if (!value) return null;
+  if (value.length <= MAX_TAB_LENGTH) return value;
+  const shortened = value.slice(0, MAX_TAB_LENGTH + 1);
+  const boundary = shortened.lastIndexOf(" ");
+  return (boundary >= 12 ? shortened.slice(0, boundary) : value.slice(0, MAX_TAB_LENGTH)).trim();
 }
 
 export function validateTabLabel(label: unknown): label is string {
@@ -367,4 +403,32 @@ export function markModelSuccess(
 ): void {
   state.fingerprints[tabId] = fingerprint(context);
   delete state.pendingFingerprints[tabId];
+  delete state.aiCircuit;
+}
+
+export function aiCircuitAllows(
+  state: SmartRenameState,
+  now = Date.now(),
+): boolean {
+  return !state.aiCircuit || state.aiCircuit.retryAt <= now;
+}
+
+export function markAiFailure(
+  state: SmartRenameState,
+  category: AiFailureCategory,
+  now = Date.now(),
+): void {
+  const previous = state.aiCircuit;
+  const failures = previous?.category === category ? previous.failures + 1 : 1;
+  const cooldown =
+    category === "config" || category === "auth" || category === "quota"
+      ? AI_LONG_COOLDOWN_MS
+      : category === "invalid-response"
+        ? AI_INVALID_COOLDOWN_MS
+        : Math.min(AI_TRANSIENT_CAP_MS, AI_TRANSIENT_BASE_MS * 2 ** Math.min(5, failures - 1));
+  state.aiCircuit = { category, failures, retryAt: now + cooldown };
+}
+
+export function clearAiFailure(state: SmartRenameState): void {
+  delete state.aiCircuit;
 }

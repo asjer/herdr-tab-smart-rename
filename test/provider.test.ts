@@ -16,10 +16,23 @@ import {
 } from "../src/configure.ts";
 import {
   AiSdkNamer,
+  aiEnabled,
+  classifyAiFailure,
   loadProviderConfig,
   type CompletionRequest,
 } from "../src/provider.ts";
 import { type NamingContext } from "../src/domain.ts";
+
+test("AI requires an explicit enable flag", () => {
+  assert.equal(aiEnabled({}), false);
+  assert.equal(aiEnabled({ SMART_RENAME_API_KEY: "configured-key" }), false);
+  assert.equal(aiEnabled({ SMART_RENAME_AI_ENABLED: "false", SMART_RENAME_API_KEY: "key" }), false);
+  assert.equal(aiEnabled({ SMART_RENAME_AI_ENABLED: "1" }), true);
+  assert.equal(aiEnabled({ SMART_RENAME_AI_ENABLED: "TRUE" }), true);
+  assert.equal(classifyAiFailure(new Error("401 unauthorized")), "auth");
+  assert.equal(classifyAiFailure(new Error("You have no credits remaining")), "quota");
+  assert.equal(classifyAiFailure(new Error("Cannot connect to API")), "network");
+});
 
 const context: NamingContext = {
   project: "Agents",
@@ -96,6 +109,7 @@ test("private provider and prompt config enforce templates, permissions, and bou
     assert.equal((await stat(fixture.root)).mode & 0o777, 0o700);
     assert.equal((await stat(file)).mode & 0o777, 0o600);
     assert.equal((await stat(prompt)).mode & 0o777, 0o600);
+    assert.match(await readFile(file, "utf8"), /SMART_RENAME_AI_ENABLED=false/);
     assert.match(await readFile(file, "utf8"), /SMART_RENAME_MODEL=gpt-5\.6-luna/);
     assert.match(await readFile(prompt, "utf8"), /^# Naming policy/);
     await assert.rejects(loadProviderConfig(fixture.env), /AI key missing.*provider\.env/i);
@@ -117,11 +131,11 @@ test("namer sends one bounded completion and validates model output", async () =
   );
   assert.deepEqual(await namer.suggest(context), {
     tab: "Repair Socket Reconnect",
-    reason: "current task",
+    reason: "AI suggestion",
   });
   assert.equal(requests.length, 1);
   assert.equal(requests[0]?.config.model, "gpt-5.6-luna");
-  assert.equal(requests[0]?.maxOutputTokens, 32_768);
+  assert.equal(requests[0]?.maxOutputTokens, 256);
   assert.equal(requests[0]?.config.reasoningEffort, "medium");
   assert.match(requests[0]?.system || "", /^# Naming policy/);
   assert.match(requests[0]?.system || "", /return exactly one JSON object/i);
@@ -133,13 +147,19 @@ test("namer sends one bounded completion and validates model output", async () =
   );
   assert.deepEqual(await abstain.suggest(context), {
     tab: null,
-    reason: "no meaningful task",
+    reason: "AI found no meaningful task",
   });
   const invalid = new AiSdkNamer(
     { SMART_RENAME_API_KEY: "standalone-key" },
     async () => '{"tab":"bad","reason":"bad"}',
   );
   await assert.rejects(invalid.suggest(context), /invalid model tab label/);
+
+  const oversizedReason = new AiSdkNamer(
+    { SMART_RENAME_API_KEY: "standalone-key" },
+    async () => JSON.stringify({ tab: null, reason: "private".repeat(100) }),
+  );
+  await assert.rejects(oversizedReason.suggest(context), /invalid-response/);
 });
 
 test("provider transport enforces the output-token ceiling without external network", async () => {
@@ -253,7 +273,7 @@ test("manifest uses portable Bun runtime without Pi model coupling", async () =>
     "utf8",
   );
   assert.match(manifest, /^id = "tab-smart-rename"$/m);
-  assert.match(manifest, /^version = "0\.1\.1"$/m);
+  assert.match(manifest, /^version = "0\.2\.0"$/m);
   assert.match(
     manifest,
     /command = \["bun", "install", "--production", "--frozen-lockfile"\]/,

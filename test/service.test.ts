@@ -1,12 +1,13 @@
 import { test } from "bun:test";
 import assert from "node:assert/strict";
-import { access, mkdtemp, rm } from "node:fs/promises";
+import { access, mkdtemp, readFile, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import {
   type PaneContext,
   type NameSuggestion,
 } from "../src/domain.ts";
+import { AiProviderError } from "../src/provider.ts";
 import {
   type HerdrPane,
   type HerdrSnapshot,
@@ -124,6 +125,7 @@ test("all-tab dry run visits tabs sequentially without writing state", async () 
   const dir = await mkdtemp(path.join(os.tmpdir(), "tab-smart-rename-dry-"));
   const paths = statePaths(dir);
   const snap = liveSnapshot();
+  delete snap.panes[0]!.agent;
   snap.tabs.push({ tab_id: "t2", workspace_id: "w1", label: "2", number: 2 });
   snap.panes.push({ pane_id: "p2", tab_id: "t2", workspace_id: "w1" });
   snap.layouts.push({ tab_id: "t2", focused_pane_id: "p2" });
@@ -156,6 +158,63 @@ test("all-tab dry run visits tabs sequentially without writing state", async () 
   }
 });
 
+test("Pi session names take priority over model-generated tab names", async () => {
+  const snap = liveSnapshot();
+  let modelCalls = 0;
+  const service = new AutoNameService({
+    dryRun: true,
+    namer: {
+      suggest: async () => {
+        modelCalls += 1;
+        return { tab: "Generated Tab Name", reason: "model" };
+      },
+    },
+    dependencies: dependencies(() => snap, {
+      focusedPaneContext: async (pane) => ({
+        ...contextFor(pane, { userMessages: ["Please organize my downloads"] }),
+        sessionMessages: {
+          name: "Downloads ordenen en grote bestanden vinden",
+          origin: ["Please organize my downloads"],
+          middle: [],
+          recent: [],
+        },
+      }),
+    }),
+  });
+
+  const result = await service.evaluate("t1", { snapshot: snap });
+  assert.ok(result);
+  assert.equal(result.candidate.tab, "Downloads ordenen en grote");
+  assert.equal(result.reason, "Pi session name");
+  assert.equal(modelCalls, 0);
+});
+
+test("Pi tabs wait for the first user prompt before naming", async () => {
+  const snap = liveSnapshot();
+  let modelCalls = 0;
+  const service = new AutoNameService({
+    dryRun: true,
+    namer: {
+      suggest: async () => {
+        modelCalls += 1;
+        return { tab: "View NPM Package Info", reason: "startup output" };
+      },
+    },
+    dependencies: dependencies(() => snap, {
+      focusedPaneContext: async (pane) => ({
+        ...contextFor(pane, { command: "pi" }),
+        recentOutput: "View NPM package info",
+      }),
+    }),
+  });
+
+  const result = await service.evaluate("t1", { snapshot: snap });
+  assert.ok(result);
+  assert.equal(result.candidate.tab, null);
+  assert.equal(result.reason, "waiting for first Pi user prompt");
+  assert.equal(modelCalls, 0);
+});
+
 test("manual ownership short-circuits context and model work", async () => {
   const dir = await mkdtemp(path.join(os.tmpdir(), "tab-smart-rename-manual-"));
   const paths = statePaths(dir);
@@ -180,7 +239,36 @@ test("manual ownership short-circuits context and model work", async () => {
   }
 });
 
-test("explicit refresh reclaims manual tabs and bypasses model gates", async () => {
+test("AI is hard-disabled by default even for explicit refresh", async () => {
+  const snap = liveSnapshot();
+  let modelCalls = 0;
+  const service = new AutoNameService({
+    dryRun: true,
+    namer: {
+      suggest: async () => {
+        modelCalls += 1;
+        return { tab: "Generated Task Name", reason: "model" };
+      },
+    },
+    dependencies: dependencies(() => snap, {
+      focusedPaneContext: async (pane) =>
+        contextFor(pane, {
+          command: "zsh",
+          userMessages: ["Give this ambiguous task a name"],
+        }),
+    }),
+  });
+  const result = await service.evaluate("t1", {
+    snapshot: snap,
+    forceRefresh: true,
+  });
+  assert.ok(result);
+  assert.equal(result.reason, "AI disabled");
+  assert.equal(result.usedModel, false);
+  assert.equal(modelCalls, 0);
+});
+
+test("explicit refresh reclaims manual tabs and bypasses model gates when AI opted in", async () => {
   const dir = await mkdtemp(path.join(os.tmpdir(), "tab-smart-rename-force-"));
   const paths = statePaths(dir);
   const snap = liveSnapshot("Manual Task");
@@ -189,6 +277,7 @@ test("explicit refresh reclaims manual tabs and bypasses model gates", async () 
   const service = new AutoNameService({
     stateFile: paths.state,
     stateLock: paths.stateLock,
+    aiEnabled: true,
     namer: {
       suggest: async () => {
         calls += 1;
@@ -240,7 +329,11 @@ test("concurrent evaluations keep expected writes durable and avoid stale races"
   const dir = await mkdtemp(path.join(os.tmpdir(), "tab-smart-rename-race-"));
   const paths = statePaths(dir);
   let label = "1";
-  const current = () => liveSnapshot(label);
+  const current = () => {
+    const snap = liveSnapshot(label);
+    delete snap.panes[0]!.agent;
+    return snap;
+  };
   let sawExpected = false;
   const service = new AutoNameService({
     stateFile: paths.state,
@@ -268,17 +361,22 @@ test("concurrent evaluations keep expected writes durable and avoid stale races"
   }
 });
 
-test("failed model calls persist attempt backoff without success fingerprint", async () => {
+test("provider failures open a persisted AI-only cooldown without worker failure", async () => {
   const dir = await mkdtemp(path.join(os.tmpdir(), "tab-smart-rename-failure-"));
   const paths = statePaths(dir);
   const snap = liveSnapshot();
   let stopped = false;
+  let calls = 0;
+  let now = 1_000_000;
   const service = new AutoNameService({
     stateFile: paths.state,
     stateLock: paths.stateLock,
+    aiEnabled: true,
+    now: () => now,
     namer: {
       suggest: async () => {
-        throw new Error("provider unavailable");
+        calls += 1;
+        throw new AiProviderError("quota", "AI request failed (quota): sk-provider-secret raw response");
       },
     },
     modelActivity: async () => async () => {
@@ -291,11 +389,28 @@ test("failed model calls persist attempt backoff without success fingerprint", a
   });
   try {
     await service.initialize(snap);
-    await assert.rejects(service.evaluate("t1"), /provider unavailable/);
+    const failed = await service.evaluate("t1");
+    assert.ok(failed);
+    assert.equal(failed.reason, "AI unavailable (quota)");
     assert.equal(stopped, true);
-    const state = await loadState(paths.state);
+    let state = await loadState(paths.state);
     assert.equal(typeof state.modelAttempts.t1, "number");
     assert.equal(state.fingerprints.t1, undefined);
+    assert.equal(state.aiCircuit?.category, "quota");
+    assert.doesNotMatch(await readFile(paths.state, "utf8"), /provider-secret|raw response/);
+
+    stopped = false;
+    const cooling = await service.evaluate("t1", { forceRefresh: true });
+    assert.ok(cooling);
+    assert.equal(cooling.reason, "AI cooling down (quota)");
+    assert.equal(calls, 1);
+    assert.equal(stopped, false);
+
+    now = state.aiCircuit!.retryAt;
+    await service.evaluate("t1", { forceRefresh: true });
+    assert.equal(calls, 2);
+    state = await loadState(paths.state);
+    assert.equal(state.aiCircuit?.failures, 2);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

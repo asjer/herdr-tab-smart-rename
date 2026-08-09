@@ -7,6 +7,7 @@ import {
   providerEnvPath,
   providerExampleText,
 } from "./provider.ts";
+import { nonProviderSubprocessEnv } from "./subprocess-env.ts";
 
 async function ensureConfigDirectory(env: NodeJS.ProcessEnv): Promise<string> {
   const directory = env.HERDR_PLUGIN_CONFIG_DIR;
@@ -48,7 +49,7 @@ export async function ensureNamingPromptFile(
 async function openEditor(file: string, env: NodeJS.ProcessEnv): Promise<void> {
   const editor = env.VISUAL || env.EDITOR || "vi";
   const child = Bun.spawn([editor, file], {
-    env,
+    env: nonProviderSubprocessEnv(env),
     stdin: "inherit",
     stdout: "inherit",
     stderr: "inherit",

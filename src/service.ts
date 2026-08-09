@@ -1,14 +1,17 @@
 import {
   acknowledgeRename,
+  aiCircuitAllows,
   buildModelContext,
   heuristicTitle,
   isDefaultLabel,
+  markAiFailure,
   markModelAttempt,
   markModelSuccess,
   observeStableContext,
   prepareRename,
   reconcileItem,
   resetOwnership,
+  sessionTabLabel,
   shouldCallModel,
   workspaceCandidate,
   type PaneContext,
@@ -27,7 +30,12 @@ import {
   type HerdrTab,
   type HerdrWorkspace,
 } from "./herdr.ts";
-import { AiSdkNamer, type Namer } from "./provider.ts";
+import {
+  AiSdkNamer,
+  aiEnabled as explicitAiEnabled,
+  classifyAiFailure,
+  type Namer,
+} from "./provider.ts";
 import {
   loadState,
   statePaths,
@@ -70,6 +78,8 @@ interface ServiceOptions {
   namer: Namer;
   env?: NodeJS.ProcessEnv;
   dryRun?: boolean;
+  aiEnabled?: boolean;
+  now?: () => number;
   modelActivity?: ModelActivity;
   dependencies?: Partial<ServiceDependencies>;
 }
@@ -128,6 +138,8 @@ export class AutoNameService {
   readonly #namer: Namer;
   readonly #env: NodeJS.ProcessEnv;
   readonly #dryRun: boolean;
+  readonly #aiEnabled: boolean;
+  readonly #now: () => number;
   readonly #modelActivity: ModelActivity | undefined;
   readonly #dependencies: ServiceDependencies;
 
@@ -137,6 +149,8 @@ export class AutoNameService {
     namer,
     env = process.env,
     dryRun = false,
+    aiEnabled = false,
+    now = Date.now,
     modelActivity,
     dependencies = {},
   }: ServiceOptions) {
@@ -145,6 +159,8 @@ export class AutoNameService {
     this.#namer = namer;
     this.#env = env;
     this.#dryRun = dryRun;
+    this.#aiEnabled = aiEnabled;
+    this.#now = now;
     this.#modelActivity = modelActivity;
     this.#dependencies = { ...defaultDependencies, ...dependencies };
   }
@@ -224,8 +240,16 @@ export class AutoNameService {
     const snap = initial ?? (await this.#dependencies.snapshot(this.#env));
     const results: RenameResult[] = [];
     for (const tab of snap.tabs) {
-      const result = await this.evaluate(tab.tab_id, options);
-      if (result) results.push(result);
+      try {
+        const result = await this.evaluate(tab.tab_id, options);
+        if (result) results.push(result);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        // A single malformed model suggestion must not prevent the remaining
+        // tabs from being evaluated by the explicit "all tabs" action.
+        if (message.includes("invalid model tab label")) continue;
+        throw error;
+      }
     }
     return results;
   }
@@ -308,10 +332,24 @@ export class AutoNameService {
       const details = await this.contextFor(tab, snap, workspaceName);
       const focusedContext = details.paneContexts.find((pane) => pane.focused);
       const hasUserTask = Boolean(focusedContext?.userMessages.length);
-      const heuristic = hasUserTask
+      const piSessionName =
+        details.focusedPane?.agent === "pi"
+          ? sessionTabLabel(focusedContext?.sessionMessages?.name)
+          : null;
+      const waitingForPiPrompt =
+        details.focusedPane?.agent === "pi" &&
+        !hasUserTask &&
+        !options.forceModel &&
+        !options.forceRefresh;
+      const heuristic = hasUserTask || waitingForPiPrompt
         ? null
         : heuristicTitle(focusedContext ? { focusedPane: focusedContext } : {});
-      if (heuristic && !options.forceModel) {
+      if (piSessionName) {
+        tabName = piSessionName;
+        reason = "Pi session name";
+      } else if (waitingForPiPrompt) {
+        reason = "waiting for first Pi user prompt";
+      } else if (heuristic && (!options.forceModel || !this.#aiEnabled)) {
         tabName = heuristic;
         reason = "process heuristic";
       } else {
@@ -323,10 +361,14 @@ export class AutoNameService {
           observeStableContext(state, tab.tab_id, details.context);
         if (!contextReady) {
           reason = "waiting for stable command context";
+        } else if (!this.#aiEnabled) {
+          reason = "AI disabled";
+        } else if (!aiCircuitAllows(state, this.#now())) {
+          reason = `AI cooling down (${state.aiCircuit?.category ?? "unknown"})`;
         } else {
-          const gate = shouldCallModel(state, tab.tab_id, details.context);
+          const gate = shouldCallModel(state, tab.tab_id, details.context, this.#now());
           if (gate.allowed || options.forceModel || options.forceRefresh) {
-            markModelAttempt(state, tab.tab_id);
+            markModelAttempt(state, tab.tab_id, this.#now());
             if (!this.#dryRun) await persist();
             const stopActivity = await this.#modelActivity?.(tab);
             try {
@@ -335,6 +377,11 @@ export class AutoNameService {
               tabName = suggestion.tab;
               reason = suggestion.reason;
               usedModel = true;
+            } catch (error) {
+              const category = classifyAiFailure(error);
+              markAiFailure(state, category, this.#now());
+              if (!this.#dryRun) await persist();
+              reason = `AI unavailable (${category})`;
             } finally {
               await stopActivity?.();
             }
@@ -419,6 +466,8 @@ interface CompositionOptions {
   env?: NodeJS.ProcessEnv;
   dryRun?: boolean;
   namer?: Namer;
+  aiEnabled?: boolean;
+  now?: () => number;
   modelActivity?: ModelActivity;
   dependencies?: Partial<ServiceDependencies>;
 }
@@ -428,6 +477,8 @@ export function createService({
   env = process.env,
   dryRun = false,
   namer = new AiSdkNamer(env),
+  aiEnabled = explicitAiEnabled(env),
+  now = Date.now,
   modelActivity,
   dependencies = {},
 }: CompositionOptions = {}): AutoNameService {
@@ -438,6 +489,8 @@ export function createService({
     namer,
     env,
     dryRun,
+    aiEnabled,
+    now,
     ...(modelActivity ? { modelActivity } : {}),
     dependencies,
   });

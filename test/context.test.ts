@@ -50,6 +50,7 @@ test("Pi session sampling weights origin, midpoint, and recent requests", async 
     session,
     [
       user("Build automatic tab naming"),
+      JSON.stringify({ type: "session_info", name: "Fix Herdr tab naming" }),
       "x".repeat(400_000),
       user("Fix manual ownership"),
       "x".repeat(400_000),
@@ -65,6 +66,7 @@ test("Pi session sampling weights origin, midpoint, and recent requests", async 
         PI_CODING_AGENT_DIR: agentDir,
       }),
       {
+        name: "Fix Herdr tab naming",
         origin: ["Build automatic tab naming"],
         middle: ["Fix manual ownership"],
         recent: [
