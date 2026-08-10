@@ -208,7 +208,10 @@ export function titleCase(input: unknown): string {
 }
 
 export function sessionTabLabel(name: unknown): string | null {
-  const value = sanitizeText(name);
+  let value = sanitizeText(name);
+  if (/^wt:/i.test(value)) {
+    value = value.slice(3).replace(/-+/g, " ").replace(/\s+/g, " ").trim();
+  }
   if (!value) return null;
   if (value.length <= MAX_TAB_LENGTH) return value;
   const shortened = value.slice(0, MAX_TAB_LENGTH + 1);

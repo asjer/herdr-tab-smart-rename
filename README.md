@@ -66,7 +66,7 @@ herdr plugin action invoke <action> --plugin tab-smart-rename
 
 Smart Rename uses one dominant pane: focused agent, another active agent, focused command, then first pane. Supporting servers and logs never replace an active agent's task.
 
-Labels use 2–4 Title Case words, stay under 30 characters, and describe the task—not its tool, model, or project. Weak evidence produces no rename. Manual labels remain locked until reset or explicit rename.
+Heuristic and model labels use 2–4 Title Case words, stay under 30 characters, and describe the task—not its tool, model, or project. Pi-derived labels preserve the session name's case; worktree names become readable by dropping the `wt:` prefix and replacing hyphens with spaces. Weak evidence produces no rename. Manual labels remain locked until reset or explicit rename.
 
 See the [naming policy](docs/naming-policy.md) for the full contract.
 
