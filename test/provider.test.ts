@@ -214,9 +214,9 @@ test("provider transport enforces the output-token ceiling without external netw
     });
     assert.deepEqual(await namer.suggest(context), {
       tab: "Bound Provider Output",
-      reason: "transport contract",
+      reason: "AI suggestion",
     });
-    assert.equal(requestBody?.max_tokens, 32_768);
+    assert.equal(requestBody?.max_tokens, 256);
   } finally {
     server.stop(true);
   }

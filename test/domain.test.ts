@@ -14,6 +14,7 @@ import {
   prepareRename,
   reconcileItem,
   resetOwnership,
+  sessionTabLabel,
   shouldCallModel,
   validateTabLabel,
   workspaceCandidate,
@@ -76,6 +77,13 @@ test("label, workspace, and process policy stays deterministic", () => {
   ] as const) {
     assert.equal(heuristicTitle({ focusedPane: { process: { command } } }), title);
   }
+});
+
+test("worktree Pi session names become readable tab labels", () => {
+  assert.equal(sessionTabLabel("wt:harden-smart-rename"), "harden smart rename");
+  assert.equal(sessionTabLabel("WT:Rails-Replatform"), "Rails Replatform");
+  assert.equal(sessionTabLabel("regular-session-name"), "regular-session-name");
+  assert.equal(sessionTabLabel("wt:---"), null);
 });
 
 test("model context keeps weighted session evidence under the hard cap", () => {
